@@ -228,3 +228,145 @@ Respond with ONLY valid JSON. No markdown formatting, no code fences, no text be
 }
 
 export const config = { maxDuration: 30 };
+// ─────────────────────────────────────────────────────────────
+// api/rubric.js  —  Vercel Serverless Function (NEW — Phase 2.2)
+//
+// Same pattern as api/grade.js: the server owns the prompt AND
+// the JSON contract. The browser sends the assignment objective
+// and gets back a real object — scoring categories, proficiency
+// levels per category, and accommodation suggestions — instead
+// of a text blob it has to display verbatim.
+//
+// REQUEST BODY:
+//   { objective, standard, standardCode, gradeLevel, pointScale }
+//
+// RESPONSE BODY:
+//   {
+//     standard, standardCode, gradeLevel, pointScale,
+//     categories: [
+//       { name, description,
+//         levels: [{ score, label, description }] }
+//     ],
+//     accommodations: [{ type, suggestion }],
+//     commonMistakes: [string],
+//     exemplarDescription: string
+//   }
+// ─────────────────────────────────────────────────────────────
+
+import { callAnthropic, parseStructuredJSON } from './_shared/anthropic.js';
+import { checkRateLimit, getClientIp } from './_shared/rateLimit.js';
+
+const MAX_OBJECTIVE_CHARS = 2000;
+const MIN_SCALE = 2;
+const MAX_SCALE = 10;
+
+const REQUIRED_KEYS = ['categories', 'accommodations'];
+
+export default async function handler(req, res) {
+  const ip = getClientIp(req);
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed — use POST' });
+  }
+
+  const limit = checkRateLimit(ip);
+  if (!limit.allowed) {
+    console.warn(JSON.stringify({ event: 'rate_limited', route: 'rubric', ip, retryAfterSeconds: limit.retryAfterSeconds }));
+    res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+    return res.status(429).json({ error: `Too many requests. Try again in ${limit.retryAfterSeconds}s.` });
+  }
+
+  const {
+    objective,
+    standard = 'General standard',
+    standardCode = '',
+    gradeLevel = 'Unspecified',
+    pointScale = 4,
+  } = req.body ?? {};
+
+  // ── Input validation ─────────────────────────────────────────
+  if (!objective || typeof objective !== 'string' || objective.trim() === '') {
+    return res.status(400).json({ error: 'objective is required and cannot be empty — describe what students should be able to do.' });
+  }
+  if (objective.length > MAX_OBJECTIVE_CHARS) {
+    return res.status(400).json({ error: `Objective too long (${objective.length} chars, max ${MAX_OBJECTIVE_CHARS}).` });
+  }
+  const scale = Number(pointScale) || 4;
+  if (scale < MIN_SCALE || scale > MAX_SCALE) {
+    return res.status(400).json({ error: `pointScale must be between ${MIN_SCALE} and ${MAX_SCALE}.` });
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error(JSON.stringify({ event: 'missing_api_key', route: 'rubric' }));
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not set. Add it in your Vercel project settings.' });
+  }
+
+  const prompt = `You are a master curriculum designer building a BARS (Behaviorally Anchored Rating Scale) rubric — every level must describe SPECIFIC, OBSERVABLE student behavior, never vague adjectives like "good" or "excellent."
+
+ASSIGNMENT OBJECTIVE (what the teacher wants to assess):
+${objective}
+
+Standard: ${standard}${standardCode ? ` (${standardCode})` : ''}
+Grade Level: ${gradeLevel}
+Point Scale: ${scale} points (design 2-4 distinct scoring categories, each scored 1 to ${scale})
+
+Also generate accommodation suggestions for common learning differences (ADHD, dyslexia, processing speed differences, anxiety, English language learners) — concrete adaptations to how the rubric is presented or applied, not generic advice.
+
+Respond with ONLY valid JSON. No markdown formatting, no code fences, no text before or after. Match this EXACT shape:
+
+{
+  "categories": [
+    {
+      "name": "<specific category name, e.g. 'Thesis & Claim'>",
+      "description": "<one sentence describing what this category assesses>",
+      "levels": [
+        { "score": ${scale}, "label": "<precise label>", "description": "<specific observable behavior at this level>" }
+      ]
+    }
+  ],
+  "accommodations": [
+    { "type": "<accommodation category, e.g. 'ADHD / Attention'>", "suggestion": "<concrete, specific adaptation>" }
+  ],
+  "commonMistakes": ["<most common student mistake at Grade ${gradeLevel} and why it drops the score>", "<second common mistake>"],
+  "exemplarDescription": "<concrete description of what a perfect ${scale}/${scale} response looks like>"
+}
+
+IMPORTANT: each category's "levels" array must include one entry for EVERY score from ${scale} down to 1 — that is ${scale} level entries per category, not just the top level.`;
+
+  const start = Date.now();
+  try {
+    const rawText = await callAnthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      maxTokens: 2000,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const parsed = parseStructuredJSON(rawText, REQUIRED_KEYS);
+
+    const result = {
+      standard,
+      standardCode,
+      gradeLevel,
+      pointScale: scale,
+      categories: Array.isArray(parsed.categories) ? parsed.categories : [],
+      accommodations: Array.isArray(parsed.accommodations) ? parsed.accommodations : [],
+      commonMistakes: Array.isArray(parsed.commonMistakes) ? parsed.commonMistakes : [],
+      exemplarDescription: parsed.exemplarDescription || '',
+    };
+
+    if (result.categories.length === 0) {
+      const err = new Error('AI did not return any scoring categories. Try again with a more specific objective.');
+      err.status = 502;
+      throw err;
+    }
+
+    console.log(JSON.stringify({ event: 'rubric_success', ip, standard, gradeLevel, pointScale: scale, categoryCount: result.categories.length, ms: Date.now() - start }));
+    return res.status(200).json(result);
+
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'rubric_error', ip, message: error.message, ms: Date.now() - start }));
+    return res.status(error.status || 500).json({ error: error.message || 'Unexpected server error while building rubric.' });
+  }
+}
+
+export const config = { maxDuration: 30 };
