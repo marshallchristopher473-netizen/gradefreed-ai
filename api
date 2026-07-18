@@ -370,3 +370,190 @@ IMPORTANT: each category's "levels" array must include one entry for EVERY score
 }
 
 export const config = { maxDuration: 30 };
+// ─────────────────────────────────────────────────────────────
+// api/schedule.js  —  Vercel Serverless Function (NEW — Phase 2.3)
+//
+// Same dedicated-route pattern as grade.js and rubric.js — but
+// this one needed a real data model built FIRST (see the frontend
+// changes: assignments and interventions are now proper objects
+// with due dates, not three loose text fields).
+//
+// REQUEST BODY:
+//   {
+//     brainType, chronotype, peakWindow, focusMinutes,
+//     assignments: [{ id, name, paperCount, minutesPerPaper, dueDate }],
+//     interventions: [{ id, studentLabel, interventionType, dueDate, notes }]
+//   }
+//
+// RESPONSE BODY:
+//   {
+//     days: [{ day, date, blocks: [{ time, task, type, durationMin, note }] }],
+//     summary: {
+//       totalPapers, hoursWithoutAI, hoursWithAI, hoursFreed,
+//       peakWindow, brainTip, protectedDay,
+//       upcomingDeadlines: [{ label, date, type }]
+//     }
+//   }
+// ─────────────────────────────────────────────────────────────
+
+import { callAnthropic, parseStructuredJSON } from './_shared/anthropic.js';
+import { checkRateLimit, getClientIp } from './_shared/rateLimit.js';
+
+const MAX_ASSIGNMENTS = 20;
+const MAX_INTERVENTIONS = 30;
+const REQUIRED_KEYS = ['days', 'summary'];
+
+export default async function handler(req, res) {
+  const ip = getClientIp(req);
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed — use POST' });
+  }
+
+  const limit = checkRateLimit(ip);
+  if (!limit.allowed) {
+    console.warn(JSON.stringify({ event: 'rate_limited', route: 'schedule', ip, retryAfterSeconds: limit.retryAfterSeconds }));
+    res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+    return res.status(429).json({ error: `Too many requests. Try again in ${limit.retryAfterSeconds}s.` });
+  }
+
+  const {
+    brainType = 'Not specified',
+    chronotype = 'Bear',
+    peakWindow = '10am – 2pm',
+    focusMinutes = '25',
+    assignments = [],
+    interventions = [],
+  } = req.body ?? {};
+
+  // ── Input validation ─────────────────────────────────────────
+  if (!Array.isArray(assignments) || assignments.length === 0) {
+    return res.status(400).json({ error: 'At least one assignment is required.' });
+  }
+  if (assignments.length > MAX_ASSIGNMENTS) {
+    return res.status(400).json({ error: `Too many assignments (max ${MAX_ASSIGNMENTS}).` });
+  }
+  if (!Array.isArray(interventions)) {
+    return res.status(400).json({ error: 'interventions must be an array (can be empty).' });
+  }
+  if (interventions.length > MAX_INTERVENTIONS) {
+    return res.status(400).json({ error: `Too many interventions (max ${MAX_INTERVENTIONS}).` });
+  }
+  for (const a of assignments) {
+    if (!a.name || typeof a.name !== 'string') {
+      return res.status(400).json({ error: 'Every assignment needs a name.' });
+    }
+    if (!Number.isFinite(Number(a.paperCount)) || !Number.isFinite(Number(a.minutesPerPaper))) {
+      return res.status(400).json({ error: `Assignment "${a.name}" has an invalid paper count or minutes-per-paper.` });
+    }
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error(JSON.stringify({ event: 'missing_api_key', route: 'schedule' }));
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not set. Add it in your Vercel project settings.' });
+  }
+
+  const totalPapers = assignments.reduce((sum, a) => sum + Number(a.paperCount), 0);
+  const totalMinutesWithoutAI = assignments.reduce((sum, a) => sum + (Number(a.paperCount) * Number(a.minutesPerPaper)), 0);
+
+  const assignmentLines = assignments.map(a =>
+    `• "${a.name}": ${a.paperCount} papers × ${a.minutesPerPaper} min/paper${a.dueDate ? `, due ${a.dueDate}` : ''}`
+  ).join('\n');
+
+  const interventionLines = interventions.length
+    ? interventions.map(iv => `• ${iv.studentLabel || 'Student'}: ${iv.interventionType}${iv.dueDate ? `, due ${iv.dueDate}` : ''}${iv.notes ? ` — ${iv.notes}` : ''}`).join('\n')
+    : '(none this week)';
+
+  const prompt = `You are an elite productivity coach for teachers, using chronobiology and workload-optimization principles.
+
+TEACHER PROFILE:
+Brain Type:     ${brainType}
+Chronotype:     ${chronotype}
+Peak Hours:     ${peakWindow}
+Focus Window:   ${focusMinutes} minutes per session
+
+GRADING ASSIGNMENTS THIS WEEK:
+${assignmentLines}
+
+INTERVENTION / STUDENT CHECK-IN REMINDERS THIS WEEK:
+${interventionLines}
+
+KEY ASSUMPTION: AI auto-grades roughly 90% of papers; the teacher only manually reviews the ~10% the AI flags as ambiguous.
+
+Build a realistic Monday–Friday schedule. Place all complex grading review sessions inside the teacher's peak window. Place intervention check-ins at reasonable, protected times (not stacked with heavy grading). Include at least one short break block per day and exactly one fully protected grading-free day. Respect assignment and intervention due dates — nothing should be scheduled after its due date.
+
+Respond with ONLY valid JSON. No markdown formatting, no code fences, no text before or after. Match this EXACT shape:
+
+{
+  "days": [
+    {
+      "day": "Monday",
+      "blocks": [
+        { "time": "9:00 AM – 9:25 AM", "task": "<specific task>", "type": "grading", "durationMin": 25, "note": "<short brain-specific note, or empty string>" }
+      ]
+    }
+  ],
+  "summary": {
+    "hoursWithoutAI": <number, decimal ok>,
+    "hoursWithAI": <number, decimal ok>,
+    "hoursFreed": <number, decimal ok>,
+    "brainTip": "<one specific, actionable tip for this brain type>",
+    "protectedDay": "<which day is fully grading-free>",
+    "upcomingDeadlines": [
+      { "label": "<assignment or intervention name>", "date": "<date as given>", "type": "assignment or intervention" }
+    ]
+  }
+}
+
+"type" for each block must be exactly one of: "grading", "review", "intervention", "break", "protected".
+Use 5 day entries (Monday through Friday), each with realistic block counts (not empty, not overstuffed).`;
+
+  const start = Date.now();
+  try {
+    const rawText = await callAnthropic({
+      apiKey: process.env.ANTHROPIC_API_KEY,
+      maxTokens: 2500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const parsed = parseStructuredJSON(rawText, REQUIRED_KEYS);
+
+    if (!Array.isArray(parsed.days) || parsed.days.length === 0) {
+      const err = new Error('AI did not return a valid weekly schedule. Try again.');
+      err.status = 502;
+      throw err;
+    }
+
+    // hoursWithoutAI/hoursFreed are computed here in code from the real
+    // assignment data, not trusted from the AI — this removes a class of
+    // potential arithmetic drift. hoursWithAI comes from the AI's actual
+    // scheduled review-block durations, since that reflects real placement.
+    const computedHoursWithoutAI = Math.round((totalMinutesWithoutAI / 60) * 10) / 10;
+    const aiHoursWithAI = Number(parsed.summary?.hoursWithAI);
+    const hoursWithAI = Number.isFinite(aiHoursWithAI) ? aiHoursWithAI : Math.round((totalMinutesWithoutAI * 0.1 / 60) * 10) / 10;
+    const hoursFreed = Math.round((computedHoursWithoutAI - hoursWithAI) * 10) / 10;
+
+    const result = {
+      totalPapers,
+      days: parsed.days,
+      summary: {
+        hoursWithoutAI: computedHoursWithoutAI,
+        hoursWithAI,
+        hoursFreed,
+        peakWindow,
+        brainTip: parsed.summary?.brainTip || '',
+        protectedDay: parsed.summary?.protectedDay || '',
+        upcomingDeadlines: Array.isArray(parsed.summary?.upcomingDeadlines) ? parsed.summary.upcomingDeadlines : [],
+      },
+    };
+
+    console.log(JSON.stringify({ event: 'schedule_success', ip, totalPapers, assignmentCount: assignments.length, interventionCount: interventions.length, hoursFreed, ms: Date.now() - start }));
+    return res.status(200).json(result);
+
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'schedule_error', ip, message: error.message, ms: Date.now() - start }));
+    return res.status(error.status || 500).json({ error: error.message || 'Unexpected server error while building schedule.' });
+  }
+}
+
+export const config = { maxDuration: 30 };
