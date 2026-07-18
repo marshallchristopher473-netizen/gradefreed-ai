@@ -66,3 +66,61 @@ export default async function handler(req, res) {
 // Explicit max duration — safely inside Vercel Hobby's configurable
 // 1–60s range, well above our own 25s internal timeout.
 export const config = { maxDuration: 30 };
+// ─────────────────────────────────────────────────────────────
+// api/_shared/rateLimit.js
+//
+// WHY THIS EXISTS:
+//   Without ANY rate limiting, one person (or one bug in the
+//   frontend, or one bot) could send thousands of requests per
+//   minute and burn through your entire Anthropic budget in
+//   under an hour. This stops that.
+//
+// THE HONEST LIMITATION (read this before trusting it fully):
+//   Vercel serverless functions do not share memory between
+//   invocations. Each request MAY hit a fresh, empty instance
+//   ("cold start"), which resets the counter below to zero.
+//   In practice, Vercel keeps a function "warm" for a few
+//   minutes after use, so this DOES catch rapid-fire abuse
+//   within a session — it just isn't a perfect, guaranteed
+//   limit across every possible request pattern.
+//
+//   This is free and requires zero setup, so it ships today.
+//
+//   THE REAL FIX (recommended before a public/paid launch):
+//   Use Upstash Redis (genuinely free tier — 10,000 commands/day)
+//   with the @upstash/ratelimit package. It's a ~15-minute swap:
+//   https://upstash.com/docs/redis/sdks/ratelimit-ts/overview
+//   That gives you a counter that survives cold starts because
+//   it lives in Upstash's database, not in Vercel's memory.
+// ─────────────────────────────────────────────────────────────
+
+const WINDOW_MS = 60_000;   // 1 minute window
+const MAX_REQUESTS = 10;    // max requests per IP per window
+
+// Lives in memory for as long as this function instance stays warm.
+const hits = new Map();
+
+export function checkRateLimit(ip) {
+  const now = Date.now();
+  const record = hits.get(ip);
+
+  if (!record || now - record.windowStart > WINDOW_MS) {
+    hits.set(ip, { count: 1, windowStart: now });
+    return { allowed: true, remaining: MAX_REQUESTS - 1 };
+  }
+
+  if (record.count >= MAX_REQUESTS) {
+    const secondsLeft = Math.ceil((WINDOW_MS - (now - record.windowStart)) / 1000);
+    return { allowed: false, remaining: 0, retryAfterSeconds: secondsLeft };
+  }
+
+  record.count += 1;
+  return { allowed: true, remaining: MAX_REQUESTS - record.count };
+}
+
+// Vercel puts the real client IP in this header behind its proxy.
+export function getClientIp(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  if (fwd) return fwd.split(',')[0].trim();
+  return req.socket?.remoteAddress ?? 'unknown';
+}
