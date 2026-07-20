@@ -3,3 +3,5 @@ grade.js
 rubric.js
 schedule.js
 rateLimit.js
+graderApi.js
+shared/
